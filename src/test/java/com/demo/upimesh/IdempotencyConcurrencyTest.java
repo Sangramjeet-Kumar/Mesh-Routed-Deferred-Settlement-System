@@ -5,6 +5,7 @@ import com.demo.upimesh.crypto.ServerKeyHolder;
 import com.demo.upimesh.model.MeshPacket;
 import com.demo.upimesh.model.PaymentInstruction;
 import com.demo.upimesh.model.AccountRepository;
+import com.demo.upimesh.model.TransactionRepository;
 import com.demo.upimesh.service.BridgeIngestionService;
 import com.demo.upimesh.service.DemoService;
 import com.demo.upimesh.service.IdempotencyService;
@@ -20,8 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * The killer test: simulates the "three bridges deliver at the same instant"
- * scenario the user explicitly cared about.
+ * Integration coverage for simultaneous duplicate delivery and encryption.
  */
 @SpringBootTest
 class IdempotencyConcurrencyTest {
@@ -32,10 +32,14 @@ class IdempotencyConcurrencyTest {
     @Autowired private AccountRepository accounts;
     @Autowired private HybridCryptoService crypto;
     @Autowired private ServerKeyHolder serverKey;
+    @Autowired private TransactionRepository transactions;
 
     @BeforeEach
     void clear() {
         idempotency.clear();
+        transactions.deleteAll();
+        accounts.deleteAll();
+        demoService.seedAccounts();
     }
 
     @Test
@@ -54,21 +58,28 @@ class IdempotencyConcurrencyTest {
         AtomicInteger duplicates = new AtomicInteger();
 
         Future<?>[] futures = new Future[3];
-        for (int i = 0; i < 3; i++) {
-            final String node = "bridge-" + i;
-            futures[i] = pool.submit(() -> {
-                try {
-                    start.await();
-                    BridgeIngestionService.IngestResult r = bridge.ingest(packet, node, 3);
-                    if ("SETTLED".equals(r.outcome())) settled.incrementAndGet();
-                    else if ("DUPLICATE_DROPPED".equals(r.outcome())) duplicates.incrementAndGet();
-                } catch (Exception e) { throw new RuntimeException(e); }
-            });
-        }
+        try {
+            for (int i = 0; i < 3; i++) {
+                final String node = "bridge-" + i;
+                futures[i] = pool.submit(() -> {
+                    try {
+                        start.await();
+                        BridgeIngestionService.IngestResult r = bridge.ingest(packet, node, 3);
+                        if ("SETTLED".equals(r.outcome())) settled.incrementAndGet();
+                        else if ("DUPLICATE_DROPPED".equals(r.outcome())) duplicates.incrementAndGet();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
 
-        start.countDown(); // release all 3 threads at once
-        for (Future<?> f : futures) f.get(5, TimeUnit.SECONDS);
-        pool.shutdown();
+            start.countDown(); // release all 3 threads at once
+            for (Future<?> f : futures) f.get(10, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
 
         assertEquals(1, settled.get(), "exactly one bridge should settle");
         assertEquals(2, duplicates.get(), "the other two should be duplicates");
@@ -78,6 +89,8 @@ class IdempotencyConcurrencyTest {
         BigDecimal bobAfter = accounts.findById("bob@demo").orElseThrow().getBalance();
         assertEquals(aliceBefore.subtract(new BigDecimal("100.00")), aliceAfter);
         assertEquals(bobBefore.add(new BigDecimal("100.00")), bobAfter);
+        assertEquals(1, transactions.count(), "exactly one ledger row should commit");
+        assertTrue(transactions.existsByPacketHash(crypto.hashCiphertext(packet.getCiphertext())));
     }
 
     @Test
@@ -92,6 +105,10 @@ class IdempotencyConcurrencyTest {
 
         BridgeIngestionService.IngestResult r = bridge.ingest(packet, "bridge-x", 1);
         assertEquals("INVALID", r.outcome());
+        assertEquals("decryption_failed", r.reason());
+        assertEquals(0, transactions.count());
+        assertEquals(new BigDecimal("5000.00"), accounts.findById("alice@demo").orElseThrow().getBalance());
+        assertEquals(new BigDecimal("1000.00"), accounts.findById("bob@demo").orElseThrow().getBalance());
     }
 
     @Test
@@ -107,5 +124,7 @@ class IdempotencyConcurrencyTest {
         assertEquals(original.getReceiverVpa(), decrypted.getReceiverVpa());
         assertEquals(0, original.getAmount().compareTo(decrypted.getAmount()));
         assertEquals(original.getNonce(), decrypted.getNonce());
+        assertEquals(original.getPinHash(), decrypted.getPinHash());
+        assertEquals(original.getSignedAt(), decrypted.getSignedAt());
     }
 }

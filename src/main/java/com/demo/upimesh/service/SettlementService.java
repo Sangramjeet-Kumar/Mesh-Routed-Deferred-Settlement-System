@@ -72,7 +72,7 @@ public class SettlementService {
         tx.setStatus(Transaction.Status.SETTLED);
         transactions.save(tx);
 
-        log.info("SETTLED ₹{} from {} to {} (packetHash={}, bridge={}, hops={})",
+        log.debug("Settlement prepared; commit pending: amount={}, sender={}, receiver={}, packetHash={}, bridge={}, hops={}",
                 amount, sender.getVpa(), receiver.getVpa(),
                 packetHash.substring(0, 12) + "...", bridgeNodeId, hopCount);
 

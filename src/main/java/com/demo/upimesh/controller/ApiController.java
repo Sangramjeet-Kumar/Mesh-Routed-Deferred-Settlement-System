@@ -106,11 +106,12 @@ public class ApiController {
 
     /**
      * "All bridge nodes simultaneously walk outside and get 4G."
-     * They all upload everything they hold to /api/bridge/ingest.
+     * They all upload everything they hold through the same ingestion service
+     * used by /api/bridge/ingest, without making HTTP requests in the simulator.
      *
      * THIS is the moment the duplicate-storm idempotency case is tested:
      * if multiple bridge nodes hold the same packet, the server gets multiple
-     * concurrent POSTs of the same ciphertext, and only one should settle.
+     * concurrent deliveries of the same ciphertext, and only one should settle.
      */
     @PostMapping("/mesh/flush")
     public Map<String, Object> meshFlush() {

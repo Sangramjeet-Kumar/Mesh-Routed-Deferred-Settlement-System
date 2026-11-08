@@ -37,10 +37,13 @@ public class BridgeIngestionService {
     private long maxAgeSeconds;
 
     public IngestResult ingest(MeshPacket packet, String bridgeNodeId, int hopCount) {
+        String packetHash = "?";
+        String stage = "hash";
         try {
-            String packetHash = crypto.hashCiphertext(packet.getCiphertext());
+            packetHash = crypto.hashCiphertext(packet.getCiphertext());
 
             // ---- Idempotency gate ----
+            stage = "claim";
             if (!idempotency.claim(packetHash)) {
                 log.info("DUPLICATE packet {} from bridge {} — dropped",
                         packetHash.substring(0, 12) + "...", bridgeNodeId);
@@ -48,32 +51,42 @@ public class BridgeIngestionService {
             }
 
             // ---- Decrypt ----
+            stage = "decrypt";
             PaymentInstruction instruction;
             try {
                 instruction = crypto.decrypt(packet.getCiphertext());
             } catch (Exception e) {
-                log.warn("Decryption failed for packet {}: {}",
-                        packetHash.substring(0, 12) + "...", e.getMessage());
+                log.warn("Packet rejected: reason=decryption_failed, packetHash={}, bridge={}, hops={}, errorType={}, detail={}",
+                        packetHash, bridgeNodeId, hopCount, e.getClass().getSimpleName(), e.getMessage());
+                log.debug("Decryption failure details for packetHash={}", packetHash, e);
                 return IngestResult.invalid(packetHash, "decryption_failed");
             }
 
             // ---- Freshness check (replay protection) ----
+            stage = "freshness";
             long ageSeconds = (Instant.now().toEpochMilli() - instruction.getSignedAt()) / 1000;
             if (ageSeconds > maxAgeSeconds) {
-                log.warn("Packet {} too old ({}s), rejected",
-                        packetHash.substring(0, 12) + "...", ageSeconds);
+                log.warn("Packet rejected: reason=stale_packet, packetHash={}, bridge={}, ageSeconds={}, maxAgeSeconds={}",
+                        packetHash, bridgeNodeId, ageSeconds, maxAgeSeconds);
                 return IngestResult.invalid(packetHash, "stale_packet");
             }
             if (ageSeconds < -300) { // small clock-skew tolerance
+                log.warn("Packet rejected: reason=future_dated, packetHash={}, bridge={}, ageSeconds={}, allowedFutureSeconds=300",
+                        packetHash, bridgeNodeId, ageSeconds);
                 return IngestResult.invalid(packetHash, "future_dated");
             }
 
             // ---- Settle ----
+            stage = "settlement";
             Transaction tx = settlement.settle(instruction, packetHash, bridgeNodeId, hopCount);
+            // The transactional service has returned after commit. Keep the legacy API outcome.
+            log.info("Payment processing committed: packetHash={}, bridge={}, hops={}, transactionId={}, ledgerStatus={}, responseOutcome=SETTLED",
+                    packetHash, bridgeNodeId, hopCount, tx.getId(), tx.getStatus());
             return IngestResult.settled(packetHash, tx);
 
         } catch (Exception e) {
-            log.error("Ingestion error: {}", e.getMessage(), e);
+            log.error("Ingestion failed: stage={}, packetHash={}, bridge={}, hops={}, errorType={}, detail={}",
+                    stage, packetHash, bridgeNodeId, hopCount, e.getClass().getSimpleName(), e.getMessage(), e);
             return IngestResult.invalid("?", "internal_error: " + e.getMessage());
         }
     }

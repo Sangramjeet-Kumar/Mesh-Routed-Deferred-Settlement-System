@@ -50,7 +50,7 @@ if not exist %WRAPPER_JAR% (
     )
 )
 
-%MAVEN_JAVA_EXE% ^
+"%MAVEN_JAVA_EXE%" ^
   %JVM_CONFIG_MAVEN_PROPS% ^
   %MAVEN_OPTS% ^
   -classpath %WRAPPER_JAR% ^
@@ -66,3 +66,4 @@ set ERROR_CODE=1
 :end
 endlocal & set ERROR_CODE=%ERROR_CODE%
 exit /B %ERROR_CODE%
+

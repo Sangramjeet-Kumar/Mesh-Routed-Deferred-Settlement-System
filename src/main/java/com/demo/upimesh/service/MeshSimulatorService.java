@@ -16,8 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * and copies packets between them, decrementing TTL each hop.
  *
  * When a device with internet (a "bridge node") holds a packet, the demo's
- * /api/mesh/flush endpoint causes it to actually POST that packet to our
- * backend — simulating the moment a phone walks outside and gets 4G.
+ * /api/mesh/flush endpoint calls the ingestion service directly, simulating
+ * the moment a phone walks outside and uploads over an internet connection.
  */
 @Service
 public class MeshSimulatorService {
