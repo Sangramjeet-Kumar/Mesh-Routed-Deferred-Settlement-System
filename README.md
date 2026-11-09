@@ -4,6 +4,11 @@ A Spring Boot backend that demonstrates **offline UPI payments routed through a 
 
 This repo is the **server side** of that system, plus a software simulator of the mesh so you can demo the whole flow on a single laptop without any real Bluetooth hardware.
 
+The dashboard is a **React + TypeScript** application in `frontend/`, built with
+Vite and packaged into the Spring Boot JAR. The backend APIs and settlement
+behavior are unchanged. See [the Phase 1 review](docs/phase-1-review.md) for known
+limitations deliberately retained during the frontend migration.
+
 ---
 
 ## Table of Contents
@@ -38,7 +43,9 @@ You'll see all three in the dashboard.
 ### Prerequisites
 
 - **JDK 17 or newer** installed and on PATH (or `JAVA_HOME` set). Check with `java -version`.
-- That's it. No database, no Redis, no Maven (the wrapper handles it). Just Java.
+- No database, Redis, global Maven, or global Node installation is needed for
+  the bundled app. Maven downloads its own Node/npm toolchain and builds React.
+- The first build needs internet access for Maven, Node, and npm dependencies.
 
 ### Run on Windows
 
@@ -48,7 +55,8 @@ Open a terminal in the project folder and run:
 mvnw.cmd spring-boot:run
 ```
 
-The first run downloads Maven (~10 MB) and all dependencies (~80 MB) — give it a couple of minutes. Subsequent runs start in a few seconds.
+The first run downloads Maven, the frontend toolchain, and dependencies. Allow a
+few minutes. Later runs reuse the downloaded toolchain and dependency caches.
 
 ### Run on Mac/Linux
 
@@ -64,6 +72,34 @@ Once you see `Started UpiMeshApplication in X.XXX seconds`, open:
 
 You'll get a dark dashboard with everything you need to drive the demo.
 
+### React development with hot reload
+
+Install Node.js **22.12+ on the 22.x line**, or a compatible newer LTS release,
+if you want to run Vite directly. Keep Spring Boot running on port 8080. In a
+second PowerShell terminal:
+
+```powershell
+cd frontend
+npm.cmd ci
+npm.cmd run dev
+```
+
+Open **http://127.0.0.1:5173**. Vite proxies `/api` to Spring Boot, so development
+uses the same endpoints without changing backend CORS settings. Stop Vite before
+running a Maven build, because Maven runs `npm ci` in the same frontend directory.
+
+### Build a standalone application
+
+```powershell
+.\mvnw.cmd clean verify
+java -jar target/upi-offline-mesh-0.0.1-SNAPSHOT.jar
+```
+
+`verify` runs the frontend type check, production build, frontend tests, and Java
+tests. The JAR contains React and all runtime UI assets, including fonts. Node is
+not needed when running the packaged JAR. Generated frontend assets are not
+committed; Maven copies `frontend/dist` into the JAR's static resources.
+
 ### Stop the server
 
 `Ctrl+C` in the terminal.
@@ -76,6 +112,10 @@ mvnw.cmd test
 
 The interesting one is `IdempotencyConcurrencyTest` — it fires three threads delivering the same packet simultaneously and asserts that exactly one settles.
 
+The full suite includes 46 Java characterization cases and 14 frontend cases.
+To run only frontend tests, use `npm.cmd test` from `frontend/`. See
+[the frontend guide](frontend/README.md) for structure and development details.
+
 ---
 
 ## The demo flow (step by step)
@@ -84,7 +124,7 @@ The dashboard has four buttons that walk through the full pipeline. The intended
 
 ### Step 1 — Compose a payment
 
-Choose sender, receiver, amount, PIN. Click **"📤 Inject into Mesh"**.
+Choose sender, receiver, amount, PIN. Click **"Encrypt & inject"**.
 
 **What actually happens on the backend:**
 - The server pretends to be the sender's phone.
@@ -97,19 +137,22 @@ You'll see `phone-alice` now holds 1 packet.
 
 ### Step 2 — Run gossip rounds
 
-Click **"🔄 Run Gossip Round"**. Then click it again.
+Click **"Run gossip round"**. Then click it again.
 
 Each round, every device that holds a packet broadcasts it to every other device within "Bluetooth range" (which, in our simulator, means everyone). TTL decrements per hop.
 
-After 1 round: every device holds the packet. After 2 rounds: still every device — TTL is just lower.
+After 1 round, every device holds the packet. Further rounds do not change TTLs
+on copies already held by a device.
 
 In the real system this would happen organically as people walk past each other in the basement.
 
 ### Step 3 — Bridge node walks outside
 
-Click **"📡 Bridges Upload to Backend"**.
+Click **"Upload to backend"**.
 
-`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates that phone walking outside and getting 4G. It POSTs every packet it holds to `/api/bridge/ingest`.
+`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates
+that phone walking outside and getting 4G. The simulator calls the same ingestion
+service used by `/api/bridge/ingest`, without making an HTTP request itself.
 
 The backend pipeline runs:
 1. Hash the ciphertext (`SHA-256`).
@@ -250,10 +293,15 @@ upi-offline-mesh/
 ├── pom.xml                                  Maven build, Spring Boot 3.3, Java 17
 ├── mvnw, mvnw.cmd                           Maven wrapper (no install needed)
 ├── README.md                                this file
+├── frontend/                                React + TypeScript dashboard
+│   ├── src/api/                             API client and types
+│   ├── src/components/                      Reusable UI and dashboard components
+│   ├── src/hooks/                           Polling and demo actions
+│   ├── src/pages/                           Dashboard page and UI tests
+│   └── src/styles/                          Responsive design system
 └── src/main/
     ├── resources/
-    │   ├── application.properties           H2 in-memory DB, port 8080, TTLs
-    │   └── templates/dashboard.html         The interactive demo UI
+    │   └── application.properties           H2 in-memory DB, port 8080, TTLs
     └── java/com/demo/upimesh/
         ├── UpiMeshApplication.java          Spring Boot main class
         │
@@ -278,8 +326,7 @@ upi-offline-mesh/
         │   └── BridgeIngestionService.java  THE pipeline: hash → claim → decrypt → freshness → settle
         │
         ├── controller/                      ── HTTP layer
-        │   ├── ApiController.java           All REST endpoints
-        │   └── DashboardController.java     Serves the dashboard HTML at /
+        │   └── ApiController.java           All REST endpoints; Spring serves React at /
         │
         └── config/
             └── AppConfig.java               @EnableScheduling for cache eviction
@@ -343,7 +390,7 @@ Run all tests:
 mvnw.cmd test
 ```
 
-The three included tests:
+The original three tests, now part of the larger characterization suite:
 
 - **`encryptDecryptRoundTrip`** — sanity-check that hybrid encryption is symmetric.
 - **`tamperedCiphertextIsRejected`** — flip a byte in the ciphertext, verify that `BridgeIngestionService` returns `INVALID` instead of crashing or settling.

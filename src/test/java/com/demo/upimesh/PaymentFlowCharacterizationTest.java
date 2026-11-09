@@ -257,7 +257,9 @@ class PaymentFlowCharacterizationTest {
 
     @Test
     void httpDemoFlowKeepsRepeatedUploadsAndResetPreservesBalancesAndLedger() throws Exception {
-        mvc.perform(get("/")).andExpect(status().isOk()).andExpect(view().name("dashboard"));
+        mvc.perform(get("/")).andExpect(status().isOk()).andExpect(forwardedUrl("index.html"));
+        mvc.perform(get("/index.html")).andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("<div id=\"root\"></div>")));
         mvc.perform(post("/api/demo/send").contentType("application/json")
                         .content("{\"senderVpa\":\"alice@demo\",\"receiverVpa\":\"bob@demo\",\"amount\":10,\"pin\":\"1234\"}"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.ttl").value(5))
