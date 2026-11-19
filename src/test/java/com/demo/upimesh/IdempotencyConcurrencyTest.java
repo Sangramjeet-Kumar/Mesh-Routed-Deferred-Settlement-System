@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Integration coverage for simultaneous duplicate delivery and encryption.
  */
 @SpringBootTest
+@org.springframework.context.annotation.Import(MemoryIdempotencyConfig.class)
 class IdempotencyConcurrencyTest {
 
     @Autowired private DemoService demoService;

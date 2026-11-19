@@ -13,7 +13,7 @@ class IdempotencyServiceCharacterizationTest {
     @Test
     @SuppressWarnings("unchecked")
     void claimsExpireOnlyWhenEvictionRunsAndLiveClaimsRemain() {
-        IdempotencyService service = new IdempotencyService();
+        InMemoryIdempotencyService service = new InMemoryIdempotencyService();
         ReflectionTestUtils.setField(service, "ttlSeconds", 60L);
         assertTrue(service.claim("expired"));
         assertTrue(service.claim("live"));

@@ -1,82 +1,124 @@
-# Mesh-Routed-Deferred-Settlement-System
+# Mesh-Routed Deferred Settlement System
 
-A Spring Boot backend that demonstrates **offline UPI payments routed through a Bluetooth-style mesh network**. You're in a basement with zero connectivity. You send your friend ₹500. Your phone encrypts the payment, broadcasts it to nearby phones, and the packet hops device-to-device until *some* phone walks outside, gets 4G, and silently uploads it to this backend. The backend decrypts, deduplicates, and settles.
+A Spring Boot application and React dashboard demonstrating encrypted payment
+instructions travelling through a simulated offline mesh, then settling when an
+internet-connected bridge delivers them to the backend.
 
-This repo is the **server side** of that system, plus a software simulator of the mesh so you can demo the whole flow on a single laptop without any real Bluetooth hardware.
+This is a deferred-settlement demo. Packet injection does not move money or
+reserve funds. There is no real Bluetooth transport, bank integration, or UPI
+network connection.
 
-The dashboard is a **React + TypeScript** application in `frontend/`, built with
-Vite and packaged into the Spring Boot JAR. The backend APIs and settlement
-behavior are unchanged. See [the Phase 1 review](docs/phase-1-review.md) for known
-limitations deliberately retained during the frontend migration.
+## Contents
 
----
+- [Current implementation](#current-implementation)
+- [Run and develop](#run-and-develop)
+- [Demo flow](#demo-flow)
+- [Architecture](#architecture)
+- [Core engineering](#core-engineering)
+- [Project structure](#project-structure)
+- [API contracts](#api-contracts)
+- [Bridge authentication and observability](#bridge-authentication-and-observability)
+- [Tests and verification](#tests-and-verification)
+- [Known limitations](#known-limitations)
+- [Next phases](#next-phases)
 
-## Table of Contents
+## Current implementation
 
-1. [What this demo proves](#what-this-demo-proves)
-2. [How to run it](#how-to-run-it)
-3. [The demo flow (step by step)](#the-demo-flow-step-by-step)
-4. [Architecture](#architecture)
-5. [The three hard problems and how they're solved](#the-three-hard-problems-and-how-theyre-solved)
-6. [File-by-file walkthrough](#file-by-file-walkthrough)
-7. [API reference](#api-reference)
-8. [Tests](#tests)
-9. [What's NOT real (and what would change for production)](#whats-not-real-and-what-would-change-for-production)
-10. [Honest limitations of the concept](#honest-limitations-of-the-concept)
+| Layer | Implementation |
+| --- | --- |
+| Backend | Java 17 target, Spring Boot 3.3.5, Spring MVC, Spring Data JPA |
+| Frontend | React, TypeScript, Vite, TanStack Query, locally bundled fonts/icons |
+| Database | PostgreSQL; Flyway migrations and Hibernate schema validation |
+| Encryption | RSA-2048 OAEP with SHA-256/MGF1-SHA-256, AES-256-GCM |
+| Idempotency | Shared Redis atomic claims with TTL; PostgreSQL unique packet hash |
+| Mesh | Five simulated devices: four offline phones and one connected bridge |
+| Packaging | One executable Spring Boot JAR containing the React production build |
 
----
+React, PostgreSQL, bridge API-key authentication, and baseline observability are
+implemented, together with Redis idempotency. H2 remains test-only. Known payment/API behaviors
+remain unchanged; external ingest and metrics now require a bridge API key.
 
-## What this demo proves
+## Run and develop
 
-The system shows three things working end to end:
+### Bundled application
 
-1. **A payment can travel from sender to backend through untrusted intermediaries** without any of them being able to read or tamper with it. (Hybrid RSA + AES-GCM encryption.)
-2. **Even if the same payment reaches the backend simultaneously through multiple bridge nodes, it settles exactly once.** (Idempotency via atomic compare-and-set on the ciphertext hash.)
-3. **A tampered or replayed packet is rejected** before it touches the ledger.
+Install JDK 17 or newer and set `JAVA_HOME` or add Java to `PATH`. Maven downloads
+its own Maven/Node/npm tooling; a global Node installation is not required for
+the bundled application. The first build needs internet access.
 
-You'll see all three in the dashboard.
+Redis must also be running. If you already created `upimesh-redis` using the
+learning commands, reuse it:
 
----
-
-## How to run it
-
-### Prerequisites
-
-- **JDK 17 or newer** installed and on PATH (or `JAVA_HOME` set). Check with `java -version`.
-- No database, Redis, global Maven, or global Node installation is needed for
-  the bundled app. Maven downloads its own Node/npm toolchain and builds React.
-- The first build needs internet access for Maven, Node, and npm dependencies.
-
-### Run on Windows
-
-Open a terminal in the project folder and run:
-
-```cmd
-mvnw.cmd spring-boot:run
+```powershell
+docker start upimesh-redis
+docker exec upimesh-redis redis-cli ping
 ```
 
-The first run downloads Maven, the frontend toolchain, and dependencies. Allow a
-few minutes. Later runs reuse the downloaded toolchain and dependency caches.
+For a fresh installation, `docker compose up -d redis` uses the pinned image,
+loopback port 6379, persistent storage, AOF, and a no-eviction policy. Do not run
+both setups on the same port. Compose does not adopt the manually created
+container. Stop the manual container first if you choose Compose; its existing
+data volume will not automatically be imported into the Compose volume.
 
-### Run on Mac/Linux
+Defaults connect to `127.0.0.1:6379`, database 0, namespace `upimesh:demo`.
+Optional `REDIS_HOST`, `REDIS_PORT`, `REDIS_DATABASE`, `REDIS_NAMESPACE`,
+`REDIS_USERNAME`, and `REDIS_PASSWORD` settings are listed in `.env.example`.
+All application instances processing the same packets must use the same Redis
+database and namespace. Credentials and TLS/network restrictions are required
+for a secured deployment; the provided local setup binds only to loopback.
+
+PostgreSQL must be running with a dedicated application database and login role.
+Set `DB_URL` (default `jdbc:postgresql://127.0.0.1:5432/upimesh`), `DB_USERNAME`
+(default `upimesh`), and the required `DB_PASSWORD` environment variable. Use the
+application role, not the administrator role. See `.env.example` for variable
+names; `.env` files are not loaded automatically.
+
+On this checkout, dedicated `upimesh` and `upimesh_test` databases and roles were
+provisioned locally. Their generated credentials are in the Git-ignored
+`.local/database.psd1`. Load them in each new PowerShell terminal:
+
+```powershell
+.\scripts\create-bridge-key.ps1  # Once per checkout; existing keys are preserved.
+. .\scripts\load-database-env.ps1
+```
+
+That helper sets environment variables for the current terminal without printing
+credentials. New checkouts must provision their own database/role and set their
+environment variables; local credentials are intentionally not committed.
+The helper also loads the key from ignored `.local/bridge.psd1`. Alternatively,
+set `BRIDGE_API_KEY` yourself. A missing or blank key prevents application startup.
+Never put this key in React source or a `VITE_*` variable.
+
+For a new installation, an administrator can provision the application database
+in an interactive `psql` session (the password command prompts securely):
+
+```text
+CREATE ROLE upimesh LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;
+\password upimesh
+CREATE DATABASE upimesh OWNER upimesh;
+```
+
+For integration tests, provision a separate `upimesh_test` role/database the same
+way. Never point the test suite at the application's database.
+
+PowerShell, from the repository root:
+
+```powershell
+.\mvnw.cmd spring-boot:run
+```
+
+macOS/Linux:
 
 ```bash
 ./mvnw spring-boot:run
 ```
 
-### Open the dashboard
+Open **http://localhost:8080**. Stop with `Ctrl+C`.
 
-Once you see `Started UpiMeshApplication in X.XXX seconds`, open:
+### React development
 
-**http://localhost:8080**
-
-You'll get a dark dashboard with everything you need to drive the demo.
-
-### React development with hot reload
-
-Install Node.js **22.12+ on the 22.x line**, or a compatible newer LTS release,
-if you want to run Vite directly. Keep Spring Boot running on port 8080. In a
-second PowerShell terminal:
+Keep Spring Boot running on port 8080. With a compatible Node installation
+(Node 22.12+ on the 22.x line, or a supported newer LTS), start a second terminal:
 
 ```powershell
 cd frontend
@@ -84,103 +126,58 @@ npm.cmd ci
 npm.cmd run dev
 ```
 
-Open **http://127.0.0.1:5173**. Vite proxies `/api` to Spring Boot, so development
-uses the same endpoints without changing backend CORS settings. Stop Vite before
-running a Maven build, because Maven runs `npm ci` in the same frontend directory.
+Open **http://127.0.0.1:5173**. Vite proxies `/api` to Spring Boot. On macOS/Linux,
+use `npm` instead of `npm.cmd`. Stop Vite before running Maven: Maven installs
+frontend dependencies in the same directory.
 
-### Build a standalone application
+### Build and run the executable JAR
 
 ```powershell
+. .\scripts\load-database-env.ps1  # Local convenience; or set DB_* yourself.
 .\mvnw.cmd clean verify
 java -jar target/upi-offline-mesh-0.0.1-SNAPSHOT.jar
 ```
 
-`verify` runs the frontend type check, production build, frontend tests, and Java
-tests. The JAR contains React and all runtime UI assets, including fonts. Node is
-not needed when running the packaged JAR. Generated frontend assets are not
-committed; Maven copies `frontend/dist` into the JAR's static resources.
+Maven checks TypeScript, builds and tests React, runs the Java tests, and bundles
+the frontend into the JAR. Node is not needed at application runtime. Generated
+assets and dependencies are excluded from Git. See [frontend/README.md](frontend/README.md).
 
-### Stop the server
+### Current database and reset behavior
 
-`Ctrl+C` in the terminal.
+Flyway creates the schema before JPA starts; Hibernate validates the mappings
+instead of recreating tables. Migrations live in `db/migration/postgresql`.
+Automatic schema deletion is disabled. The application no longer contains H2
+at runtime, and `/h2-console` is unavailable.
 
-### Run the tests
+When the account table is empty, the existing demo seeder creates Alice INR 5000,
+Bob INR 1000, Carol INR 2500, and Dave INR 500. Otherwise it leaves accounts alone.
+Balances and ledger rows survive application restarts. Redis retains unexpired
+claims independently of application processes. Mesh packets and RSA keys still
+reset; old encrypted packets may become undecryptable.
+**Reset mesh & cache** still clears only packets and claims, retaining ledger and
+balances. No automatic H2 data import is performed.
 
-```cmd
-mvnw.cmd test
-```
+## Demo flow
 
-The interesting one is `IdempotencyConcurrencyTest` — it fires three threads delivering the same packet simultaneously and asserts that exactly one settles.
+1. **Compose:** choose sender, receiver, amount, and demo PIN; click **Encrypt &
+   inject**. `DemoService` creates a payment instruction with a UUID nonce and
+   timestamp, encrypts it, and injects a TTL-5 packet at `phone-alice`.
+2. **Gossip:** click **Run gossip round**. All devices are in range in this
+   simulator. One round copies the packet to the other four devices, decrementing
+   TTL on each new copy. Further rounds leave already-held copies unchanged.
+3. **Upload:** click **Upload to backend**. The bridge's held packets are delivered
+   to `BridgeIngestionService` in parallel. The simulator calls that service
+   directly; external bridges can POST to `/api/bridge/ingest`.
+4. **Inspect:** view account balances, ledger status, packet counts, and the
+   activity stream. Upload responses and ledger statuses are displayed separately.
+5. **Repeat upload:** click **Upload to backend** again. Packets remain at the
+   bridge, so the same encoded ciphertext is uploaded again and ordinarily returns
+   `DUPLICATE_DROPPED` while its claim exists.
 
-The full suite includes 46 Java characterization cases and 14 frontend cases.
-To run only frontend tests, use `npm.cmd test` from `frontend/`. See
-[the frontend guide](frontend/README.md) for structure and development details.
-
----
-
-## The demo flow (step by step)
-
-The dashboard has four buttons that walk through the full pipeline. The intended sequence:
-
-### Step 1 — Compose a payment
-
-Choose sender, receiver, amount, PIN. Click **"Encrypt & inject"**.
-
-**What actually happens on the backend:**
-- The server pretends to be the sender's phone.
-- It builds a `PaymentInstruction` with a unique nonce and current timestamp.
-- It encrypts that with the server's RSA public key (using hybrid encryption — see below).
-- It wraps the ciphertext in a `MeshPacket` with a TTL of 5.
-- It hands the packet to `phone-alice`, an offline virtual device.
-
-You'll see `phone-alice` now holds 1 packet.
-
-### Step 2 — Run gossip rounds
-
-Click **"Run gossip round"**. Then click it again.
-
-Each round, every device that holds a packet broadcasts it to every other device within "Bluetooth range" (which, in our simulator, means everyone). TTL decrements per hop.
-
-After 1 round, every device holds the packet. Further rounds do not change TTLs
-on copies already held by a device.
-
-In the real system this would happen organically as people walk past each other in the basement.
-
-### Step 3 — Bridge node walks outside
-
-Click **"Upload to backend"**.
-
-`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates
-that phone walking outside and getting 4G. The simulator calls the same ingestion
-service used by `/api/bridge/ingest`, without making an HTTP request itself.
-
-The backend pipeline runs:
-1. Hash the ciphertext (`SHA-256`).
-2. Try to claim the hash in the idempotency cache.
-3. If claimed: decrypt with the server's RSA private key.
-4. Verify freshness (signedAt within 24 hours).
-5. Run the debit/credit in a single DB transaction.
-
-Watch the **Account Balances** table — money has moved. Watch the **Transaction Ledger** — a new row appears.
-
-### Step 4 — Demonstrate idempotency (the killer feature)
-
-Reset the mesh. Inject a single packet. Run gossip 2 times. Now **all 5 devices hold the same packet, including multiple bridges in a more complex setup**.
-
-To really see idempotency in action, modify `MeshSimulatorService.java` to seed multiple bridge devices, or just:
-
-1. Click "Inject" once.
-2. Click "Gossip" twice.
-3. Click "Flush Bridges" — only `phone-bridge` is a bridge in the default seed, so just one upload happens.
-
-To exercise the *concurrent duplicate* case properly, run the test:
-```cmd
-mvnw.cmd test -Dtest=IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce
-```
-
-This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest()` simultaneously, and verifies that exactly one settles, two are dropped as duplicates, and the sender is debited exactly once.
-
----
+The default mesh has one bridge. The concurrency tests exercise simultaneous
+uploads of the same packet from multiple bridges. Diagram edges indicate possible
+connections and shared packets, not recorded routes. Rounds and activity are local
+to the browser session; mesh and financial state come from the backend.
 
 ## Architecture
 
@@ -205,12 +202,15 @@ This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest(
 │  /api/bridge/ingest                                                     │
 │       │                                                                 │
 │       ▼                                                                 │
+│  [0] HttpBoundaryFilter: verify X-Bridge-Api-Key                         │
+│       │       Missing/invalid key → HTTP 401, no ingestion work           │
+│       ▼                                                                 │
 │  [1] hash ciphertext (SHA-256)                                          │
 │       │                                                                 │
 │       ▼                                                                 │
-│  [2] IdempotencyService.claim(hash)  ◀── atomic putIfAbsent (≈ Redis    │
-│       │                                  SETNX). Duplicates rejected    │
-│       │                                  here, before any work.         │
+│  [2] RedisIdempotencyService.claim(hash) ◀── atomic SET NX + expiry     │
+│       │       Shared across instances; duplicates stop here.           │
+│       │       No confirmed claim → no decryption or settlement.         │
 │       ▼                                                                 │
 │  [3] HybridCryptoService.decrypt(ciphertext)                            │
 │       │       (RSA-OAEP unwraps AES key, AES-GCM decrypts payload       │
@@ -225,141 +225,175 @@ This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest(
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+The diagram shows the conceptual phone-to-server path. BLE is simulated, the
+local server uses HTTP, and TLS termination is a deployment concern. The React
+UI controls the simulator through the existing `/api` endpoints. Its read queries
+poll every three seconds and refresh after actions; POST actions are not retried
+automatically.
 
-## The three hard problems and how they're solved
+## Core engineering
 
-### Problem 1: Untrusted intermediates
+### 1. Hybrid encryption across untrusted relays
 
-A random stranger's phone is carrying your transaction. How do you stop them from reading the amount or changing it?
+`PaymentInstruction` contains sender/receiver VPAs, amount, PIN hash, nonce, and
+`signedAt`. The outer `MeshPacket` contains readable `packetId`, `ttl`, `createdAt`,
+and an opaque Base64-encoded encrypted envelope.
 
-**Solution: Hybrid encryption (RSA-OAEP + AES-GCM).**
+RSA-OAEP encrypts only small payloads, so the application uses hybrid encryption:
 
-The sender encrypts the payload with the server's public key. Only the server holds the private key, so intermediates see opaque ciphertext.
+1. Generate a fresh AES-256 key and random 12-byte IV for each encryption.
+2. Encrypt the instruction JSON with AES-GCM and a 128-bit authentication tag.
+3. Wrap the AES key with the server's RSA-2048 public key, explicitly selecting
+   SHA-256 for both OAEP and MGF1.
+4. Encode the combined binary envelope as Base64:
 
-But RSA can only encrypt small data (~245 bytes for a 2048-bit key), and our payload is JSON that could exceed that. So we use the standard hybrid pattern:
+```text
+[256-byte RSA-wrapped AES key][12-byte IV][AES ciphertext + 16-byte GCM tag]
+```
 
-1. Generate a fresh AES-256 key for *this packet*.
-2. Encrypt the JSON with **AES-256-GCM** (fast + authenticated).
-3. Encrypt just the AES key with **RSA-OAEP**.
-4. Concatenate: `[256 bytes RSA-encrypted AES key][12 bytes IV][AES ciphertext + 16-byte GCM tag]`.
+The server unwraps the key, verifies/decrypts GCM, and deserializes the instruction.
+Wrapped-key, IV, payload, or tag modification causes decryption to fail. Relays
+can alter outer routing metadata, so the backend does not use `packetId` or
+`createdAt` for payment identity or freshness.
 
-**Why GCM specifically?** It's authenticated encryption. If an intermediate flips one bit anywhere in the ciphertext, decryption throws an exception — the GCM tag won't verify. The server cannot be tricked into processing tampered data.
+Encryption protects confidentiality and integrity of the encrypted instruction;
+it does not authenticate the account holder. `signedAt` is not a digital
+signature, and the demo does not verify `pinHash`. See `HybridCryptoService` and
+`ServerKeyHolder`.
 
-This is the same scheme TLS uses. See `HybridCryptoService.java`.
+### 2. Ciphertext identity and concurrent duplicate delivery
 
-### Problem 2: The duplicate-storm
-
-Three bridge nodes hold the same packet. They all walk outside at the same instant. They all POST to `/api/bridge/ingest` within milliseconds of each other. If you naively process all three, the sender is debited ₹1500 instead of ₹500.
-
-**Solution: Atomic compare-and-set on the ciphertext hash.**
-
-The very first thing the server does on receiving a packet is compute `SHA-256(ciphertext)` and try to "claim" that hash:
+The backend currently hashes the **Base64 ciphertext text**, using SHA-256. It
+claims that hash before doing RSA decryption:
 
 ```java
-// IdempotencyService.java
-Instant prev = seen.putIfAbsent(packetHash, now);
-return prev == null;  // true = first claimer, false = duplicate
+Boolean claimed = redis.opsForValue().setIfAbsent(key, "claimed", ttl);
+if (claimed == null) throw new IllegalStateException("Unconfirmed Redis claim");
+return claimed;
 ```
 
-`ConcurrentHashMap.putIfAbsent` is atomic. Even if 100 threads call it at the exact same nanosecond, exactly one returns `null` (the first claimer) and the rest return the existing entry. Only the first claimer proceeds to decrypt and settle. The rest are short-circuited as `DUPLICATE_DROPPED`.
+The write maps to Redis `SET ... NX EX/PX ...`: the condition and expiry are one
+atomic command. One caller wins across all instances sharing the store; others
+for the same hash return `DUPLICATE_DROPPED`. Changing the outer packet ID does not
+change this hash. Hashing before decryption avoids repeated RSA work for duplicate
+encoded packets.
 
-**Why hash the ciphertext, not the packetId or the cleartext?**
-- `packetId` can be rewritten by a malicious intermediate. Two copies of the same payment could have different packetIds. Bad key.
-- The cleartext requires decryption first. We want to dedupe *before* spending CPU on RSA.
-- The ciphertext is authenticated by GCM, so any tampering is detectable on decrypt. Two legitimate deliveries of the same payment have byte-identical ciphertexts (AES is deterministic for a given key+IV+plaintext, and the same packet means the same key+IV+plaintext).
+The transaction table also enforces uniqueness of `packet_hash`. Together with
+transactional settlement, this protects against multiple committed settlements
+for the same hash. It is not a guarantee of eventual successful settlement after
+failure, across restarts, or for every representation of the same encrypted bytes.
 
-In production this `ConcurrentHashMap` becomes Redis: `SET key NX EX 86400`. Same semantics, distributed across replicas.
+Keys are `mesh:{<namespace>}:claim:<unchanged-ciphertext-hash>`. Redis enforces the
+configured 24-hour TTL without a Java eviction scheduler. Unlike the old map,
+expired claims become available promptly rather than waiting for minute-based
+cleanup. Failed processing still retains its acquired claim until expiry/reset.
 
-There's also a defense-in-depth fallback: `transactions.packet_hash` has a unique index. If the cache layer ever fails and two settlements somehow try to write the same hash, the database rejects the second one.
+Redis errors and unconfirmed replies propagate to ingestion's existing catch:
+HTTP ingestion returns legacy `INVALID` / `internal_error`, with no settlement.
+An outage is never interpreted as a duplicate and there is no local fallback or
+automatic application-level claim retry. A timeout can leave an uncertain claim
+in Redis; it is not deleted to force a retry. PostgreSQL uniqueness remains the
+durable guard because Redis and PostgreSQL do not share one atomic transaction.
 
-### Problem 3: Replay attacks
+`size()` and reset use namespaced SCAN, not `KEYS` or database-wide flushing.
+The count is a diagnostic snapshot, deduplicated against repeated scan results;
+expiry and concurrent uploads can still change it. Reset deletes only this exact
+namespace in batches and is not atomic against active uploads. It affects every
+instance sharing that namespace. Use demo reset only while uploads are idle.
 
-An attacker who captured a ciphertext weeks ago could replay it whenever convenient.
+The Docker configuration persists AOF data on a volume. With `appendfsync everysec`,
+a crash can lose roughly the latest second of writes. Keep eviction disabled and
+do not treat Redis persistence as an unlimited exactly-once guarantee. See the
+[Redis migration review](docs/redis-migration.md) for failure and lifecycle limits.
 
-**Solution: Two layers.**
+### 3. Freshness and replay protection
 
-1. **Inside the encrypted payload**, the sender includes `signedAt` (epoch millis). The server rejects any packet older than 24 hours. The attacker can't change `signedAt` without breaking the GCM tag.
-2. **Inside the encrypted payload**, the sender includes a **nonce** (UUID). Even if Alice legitimately sends Bob ₹100 twice, the nonces differ → ciphertexts differ → hashes differ → both settle. But a *replay* of one specific signed packet is byte-identical, so the idempotency cache catches it.
+After decryption, ingestion checks the protected `signedAt` timestamp. It rejects
+instructions older than the configured 24-hour window and those more than roughly
+five minutes in the future; age comparisons truncate to whole seconds.
 
-See `BridgeIngestionService.java` for the freshness check.
+Repeating an identical encoded packet is caught by its hash while claimed. A
+settled hash also remains unique in the current database. A fresh nonce helps
+identify a distinct instruction, but nonce reuse is not independently checked.
+Encryption itself is randomized, so re-encrypting the same instruction produces
+a different ciphertext and hash. Alternate accepted Base64 encodings also have
+different text hashes; this known replay gap is retained pending approval.
 
----
+### 4. Atomic financial updates and account concurrency
 
-## File-by-file walkthrough
+`SettlementService.settle()` is a Spring-managed `@Transactional` operation:
 
+```text
+load sender + receiver
+        ↓
+require positive amount and check sender balance
+        ↓
+sufficient funds → debit sender + credit receiver + SETTLED ledger row
+insufficient funds → REJECTED ledger row; balances unchanged
+        ↓
+commit together, or roll back on failure
 ```
-upi-offline-mesh/
-├── pom.xml                                  Maven build, Spring Boot 3.3, Java 17
-├── mvnw, mvnw.cmd                           Maven wrapper (no install needed)
-├── README.md                                this file
-├── frontend/                                React + TypeScript dashboard
-│   ├── src/api/                             API client and types
-│   ├── src/components/                      Reusable UI and dashboard components
-│   ├── src/hooks/                           Polling and demo actions
-│   ├── src/pages/                           Dashboard page and UI tests
-│   └── src/styles/                          Responsive design system
-└── src/main/
-    ├── resources/
-    │   └── application.properties           H2 in-memory DB, port 8080, TTLs
-    └── java/com/demo/upimesh/
-        ├── UpiMeshApplication.java          Spring Boot main class
-        │
-        ├── model/                           ── Domain layer
-        │   ├── Account.java                 JPA entity. @Version = optimistic lock
-        │   ├── AccountRepository.java       Spring Data JPA
-        │   ├── Transaction.java             Settled-tx ledger. unique idx on packetHash
-        │   ├── TransactionRepository.java   Spring Data JPA
-        │   ├── MeshPacket.java              Wire format. Outer fields readable, ciphertext opaque
-        │   └── PaymentInstruction.java      Decrypted payload (sender/receiver/amount/nonce/time)
-        │
-        ├── crypto/                          ── Cryptography layer
-        │   ├── ServerKeyHolder.java         Generates RSA-2048 keypair on startup
-        │   └── HybridCryptoService.java     RSA-OAEP + AES-256-GCM encrypt/decrypt + ciphertext hash
-        │
-        ├── service/                         ── Business logic
-        │   ├── DemoService.java             Seeds accounts, simulates a sender phone
-        │   ├── VirtualDevice.java           One simulated phone in the mesh
-        │   ├── MeshSimulatorService.java    Gossip protocol across virtual devices
-        │   ├── IdempotencyService.java      ConcurrentHashMap = JVM-local Redis SETNX
-        │   ├── SettlementService.java       @Transactional debit + credit + ledger insert
-        │   └── BridgeIngestionService.java  THE pipeline: hash → claim → decrypt → freshness → settle
-        │
-        ├── controller/                      ── HTTP layer
-        │   └── ApiController.java           All REST endpoints; Spring serves React at /
-        │
-        └── config/
-            └── AppConfig.java               @EnableScheduling for cache eviction
 
+Money uses `BigDecimal` with database precision 19 and scale 2. Each `Account`
+has an `@Version` field for optimistic locking. Distinct concurrent payments can
+conflict on those versions; a failed transaction rolls back rather than losing
+an update. There is no automatic retry policy. Cache claims are outside the
+financial database transaction.
+
+The insufficient-funds ledger status is `REJECTED`, while ingestion currently
+returns `SETTLED` for that recorded outcome. The UI shows both values independently;
+this migration does not correct that API inconsistency.
+
+## Project structure
+
+```text
+frontend/
+  src/api/                 Typed API client and transport types
+  src/components/ui/       Shared controls and status badges
+  src/components/dashboard/ Composer, mesh, balances, ledger, activity
+  src/hooks/               Polling, action locking, activity state
+  src/pages/               Dashboard composition and interaction tests
+  src/styles/              Responsive styling and accessibility states
+  public/licenses/         Bundled font notices
+src/main/java/com/demo/upimesh/
+  controller/              REST endpoints in ApiController
+  service/                 Demo creation, mesh, idempotency, ingestion, settlement
+  crypto/                  RSA key lifecycle and hybrid encryption
+  model/                   JPA entities, repositories, packet/instruction models
+  config/                  HTTP authentication, correlation, and metric binding
+src/main/resources/
+  application.properties   PostgreSQL, server, logging, and freshness settings
+  db/migration/postgresql/ Versioned PostgreSQL schema migrations
 src/test/java/com/demo/upimesh/
-└── IdempotencyConcurrencyTest.java          The 3-bridges-at-once test + tamper test
+                           Java characterization and concurrency tests
+docs/                      Phase reviews, limitations, and migration plans
+pom.xml                    Combined frontend/backend build
 ```
 
----
+## API contracts
 
-## API reference
+| Method | Path | Behavior |
+| --- | --- | --- |
+| GET | `/` | React dashboard |
+| GET | `/api/server-key` | Base64 public key and algorithm metadata |
+| GET | `/api/accounts` | Accounts and current balances |
+| GET | `/api/transactions` | Latest 20 ledger entries, descending ID |
+| GET | `/api/mesh/state` | Device state, shortened packet IDs, cache size |
+| POST | `/api/demo/send` | Encrypt and inject a demo instruction |
+| POST | `/api/mesh/gossip` | Run one gossip round |
+| POST | `/api/mesh/flush` | Deliver packets held by connected bridges |
+| POST | `/api/mesh/reset` | Clear mesh and cache; retain balances/ledger |
+| POST | `/api/bridge/ingest` | API-key-protected external ingestion |
+| GET | `/actuator/health` | Public status only, without component details |
+| GET | `/actuator/metrics` | API-key-protected metric names |
+| GET | `/actuator/metrics/{name}` | API-key-protected metric measurements |
 
-| Method | Path | What it does |
-|---|---|---|
-| GET | `/` | Dashboard HTML |
-| GET | `/api/server-key` | Server's RSA public key (base64) |
-| GET | `/api/accounts` | All accounts and balances |
-| GET | `/api/transactions` | Last 20 transactions |
-| GET | `/api/mesh/state` | Current state of every virtual device |
-| POST | `/api/demo/send` | Simulate sender phone — encrypt + inject packet |
-| POST | `/api/mesh/gossip` | Run one round of gossip across the mesh |
-| POST | `/api/mesh/flush` | Bridges with internet upload to backend (parallel) |
-| POST | `/api/mesh/reset` | Clear mesh + idempotency cache |
-| POST | `/api/bridge/ingest` | **The production endpoint.** Real bridges POST here |
-| GET | `/h2-console` | Browse the in-memory database |
-
-H2 console login: JDBC URL `jdbc:h2:mem:upimesh`, username `sa`, no password.
-
-### Request format for `/api/bridge/ingest`
+Example bridge request:
 
 ```http
 POST /api/bridge/ingest
 Content-Type: application/json
+X-Bridge-Api-Key: <your-bridge-api-key>
 X-Bridge-Node-Id: phone-bridge-42
 X-Hop-Count: 3
 
@@ -367,86 +401,215 @@ X-Hop-Count: 3
   "packetId": "550e8400-e29b-41d4-a716-446655440000",
   "ttl": 2,
   "createdAt": 1730000000000,
-  "ciphertext": "base64-encoded-RSA-and-AES-blob"
+  "ciphertext": "base64-encoded-encrypted-envelope"
 }
 ```
 
-Response:
+The outer `createdAt` above is illustrative; freshness uses the timestamp inside
+the encrypted instruction. Bridge headers default to `unknown` and `0`.
+
 ```json
 {
-  "outcome": "SETTLED",                     // or "DUPLICATE_DROPPED" or "INVALID"
-  "packetHash": "a3f8c9...",
-  "reason": null,                            // populated on INVALID
-  "transactionId": 42                        // populated on SETTLED
+  "outcome": "SETTLED",
+  "packetHash": "sha256-hex-string",
+  "reason": null,
+  "transactionId": 42
 }
 ```
 
----
+Ingestion returns `SETTLED`, `DUPLICATE_DROPPED`, or `INVALID`. Service-returned
+outcomes use HTTP 200; malformed HTTP input can still fail before ingestion.
+Duplicate results have no transaction ID. Invalid reasons include
+`decryption_failed`, `stale_packet`, `future_dated`, and legacy `internal_error`
+messages. Mesh-flush results substitute an empty reason and transaction ID `-1`
+when those fields are absent. Those contracts are unchanged.
 
-## Tests
+## Bridge authentication and observability
 
-Run all tests:
+External requests under `/api/bridge/` require exactly one `X-Bridge-Api-Key`
+header matching `BRIDGE_API_KEY`. Missing, incorrect, blank, or repeated headers
+return HTTP 401 with `reason: invalid_or_missing_api_key` before body parsing,
+decryption, or hash claiming. Keys are compared via fixed-length SHA-256 digests
+and `MessageDigest.isEqual`; credentials are not logged. This authentication hash
+is separate from the unchanged payment ciphertext-hash calculation.
+
+Authorized ingestion retains the existing HTTP 200 and outcome semantics.
+The key is not accepted through a query string. `X-Bridge-Node-Id` remains
+caller-supplied metadata, not an authenticated device identity. Use HTTPS when
+bridges connect across a network; local HTTP does not protect a transmitted key.
+Key rotation currently requires changing the server secret and restarting it.
+
+The simulator's `/api/mesh/flush` calls ingestion directly, so the React demo does
+not need the key. Demo controls remain unauthenticated; this phase does not make
+the entire demo a production-secure payment service. Restrict access to the demo
+deployment separately. Authentication does not verify the sender or PIN.
+
+Only Actuator `health` and `metrics` are enabled/exposed. Health reveals status
+without database/component details. Metrics use the same bridge key. Environment,
+configuration, heap dump, and other Actuator endpoints are not exposed.
+
+| Meter | Meaning |
+| --- | --- |
+| `mesh.ingestion` | Response count and duration, tagged by bounded `outcome` |
+| `mesh.http.authentication` | Accepted/rejected key checks for bridge or metrics |
+| `mesh.idempotency.claims` | Shared Redis claim-count snapshot, including failed attempts |
+| `mesh.devices` | Simulated device count |
+| `mesh.packet.copies` | Total copies held across simulated devices |
+| `http.server.requests`, JVM/pool meters | Standard Actuator HTTP/runtime diagnostics |
+
+`mesh.ingestion` observes external and simulator calls. Its `SETTLED` label means
+the legacy ingestion response, not necessarily a SETTLED ledger row. Meters never
+use hashes, VPAs, amounts, bridge IDs, credentials, or error text as labels.
+Counters/timers are process-local and reset on restart; the claim gauge reads the
+shared Redis store. No external exporter is installed. Namespace scans are suitable
+for this demo's size, not an O(1) production counting strategy.
+
+API/Actuator requests receive a server-generated `X-Request-Id`, also used in the
+HTTP thread's logging context. Client request IDs are not trusted. The previous
+logging context is restored after completion. Request-completion logs are DEBUG
+and omit headers, bodies, query strings, and raw paths. Correlation is not
+automatically propagated to parallel simulator worker threads.
+
+## Tests and verification
+
+```powershell
+.\mvnw.cmd test
+.\mvnw.cmd clean verify
 ```
-mvnw.cmd test
+
+The default suite contains **67 Java cases and 14 frontend cases (81 total)**:
+
+- Java: simultaneous duplicate delivery, unique ledger persistence, both account
+  balances, crypto compatibility/tampering, freshness, malformed input, cache
+  behavior, rollback, optimistic-lock conflicts, and the HTTP demo flow.
+- React: request payloads, workflow interactions, independent response/ledger
+  statuses, amount compatibility, duplicate-click locking, error recovery,
+  filtering, and safe rendering of API text.
+- HTTP boundary: missing/invalid/repeated keys, matrix-parameter paths, preserved
+  request bodies, fail-closed configuration, correlation cleanup, and protected
+  metrics/minimal health. Original authorized payment assertions are retained.
+
+From `frontend/`, `npm.cmd test` runs frontend tests and `npm.cmd run build`
+checks TypeScript and builds assets. Test-only state is isolated from a running
+application's database. Characterization tests intentionally preserve known bugs.
+
+The packaged desktop demo and Vite proxy were previously verified. Mobile visual
+verification remains incomplete after browser control was stopped. See the
+[React migration review](docs/react-migration.md) for verification details.
+
+### PostgreSQL integration tests
+
+```powershell
+. .\scripts\load-database-env.ps1
+.\mvnw.cmd verify -Ppostgres-it
 ```
 
-The original three tests, now part of the larger characterization suite:
+Set `PG_TEST_URL`, `PG_TEST_USERNAME`, and `PG_TEST_PASSWORD` if not using the local
+helper. The target database name must end in `_test` and its URL must differ from
+`DB_URL`. The role must be able to create schemas in that dedicated database.
+The suite creates a random `mesh_it_*` schema and drops only that schema when
+finished. It fails if required connection settings are missing.
 
-- **`encryptDecryptRoundTrip`** — sanity-check that hybrid encryption is symmetric.
-- **`tamperedCiphertextIsRejected`** — flip a byte in the ciphertext, verify that `BridgeIngestionService` returns `INVALID` instead of crashing or settling.
-- **`singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`** — the headline test. Three threads, one packet, simultaneous delivery. Asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and that the sender's balance changed by exactly the amount once.
+All **8 PostgreSQL integration cases** pass on the local PostgreSQL 18 service,
+in addition to the 81 default cases, for **89 passing cases**. They cover migration/validation, concurrent
+duplicate delivery, database uniqueness, rollback and claim retention, rejected
+ledger/SETTLED response compatibility, numeric rounding, optimistic conflicts,
+and balance/ledger persistence across application-context restarts. The packaged
+JAR also serves the React page and account/mesh APIs successfully with PostgreSQL.
 
----
+### Redis and PostgreSQL integration tests
 
-## What's NOT real (and what would change for production)
+With Docker running and the same dedicated `PG_TEST_*` settings loaded:
 
-This is a teaching demo. To make it production-grade you'd swap these things:
+```powershell
+. .\scripts\load-database-env.ps1
+.\mvnw.cmd verify -Predis-it
+```
 
-| What's in the demo | What it would be in production |
-|---|---|
-| H2 in-memory DB | PostgreSQL / MySQL with replicas |
-| `ConcurrentHashMap` for idempotency | Redis with `SET NX EX` |
-| RSA keypair regenerated on every startup | Private key in HSM (AWS KMS, HashiCorp Vault). Public key cached on devices. |
-| Server-side `DemoService.createPacket()` | Same code running on Android, in a Kotlin port |
-| Software-simulated mesh (`MeshSimulatorService`) | Real BLE GATT or Wi-Fi Direct between phones |
-| One settlement service that owns the ledger | Integration with NPCI / a real bank core |
-| No auth on `/api/bridge/ingest` | Mutual TLS or signed bridge-node certificates |
-| In-memory accounts seeded on startup | Real KYC'd users, real VPAs, real PIN verification against the bank |
-| H2 console exposed | Disabled |
-| No rate limiting | Per-bridge-node rate limit, per-sender velocity check |
-| Logs to console | Structured logs to a SIEM, alerts on `INVALID` spikes |
+This profile runs **23 integration cases**, including the 8 PostgreSQL cases,
+for **104 passing cases with the default suites**. Do not combine it with
+`-Ppostgres-it`. Redis tests create their own disposable containers and data
+volumes; they never stop, reset, or flush your `upimesh-redis` container.
 
-The cryptography and idempotency code is essentially production-shaped. The infrastructure around it is what changes.
+Coverage includes atomic claims across independent clients, exact TTL expiry,
+namespace-scoped count/reset, Redis restart persistence, unavailable/unconfirmed
+claims, retained claims after failure, and concurrent settlement across two
+application contexts sharing Redis and a test-only RSA key. The PostgreSQL
+settlement contract also runs with the real Redis implementation.
 
----
+The packaged JAR was verified against the existing local Redis and PostgreSQL:
+React served successfully, health was UP, malformed packets retained their
+claims, duplicates remained blocked after a full JVM restart, and resetting an
+isolated smoke-test namespace cleared its claims without changing account or
+ledger data. See the [Redis migration review](docs/redis-migration.md).
 
-## Honest limitations of the concept
+## Known limitations
 
-I want this README to be useful to you when someone reviews the project, so let's be straight about what this design **does not** solve. These are not implementation bugs — they're inherent to "no internet, anywhere in the chain":
+These remain deferred; documenting them does not change behavior:
 
-1. **The receiver has no way to verify the sender has the funds.** When sender hands receiver a phone showing "₹500 sent," it's an IOU, not a settled payment. If the sender's account is empty when the packet finally reaches the backend, the settlement will be `REJECTED` and the receiver is out ₹500 with no recourse. *This is why real offline UPI (UPI Lite) uses a pre-funded hardware-backed wallet* — to give cryptographic proof of available funds offline.
-2. **A malicious sender can double-spend offline.** With ₹500 in their account, they could send a packet to Bob in basement A, walk to basement B, and send another ₹500 to Carol. Whichever packet hits the backend first wins; the other gets `REJECTED`. Same root cause as #1.
-3. **Bluetooth in real life is hard.** Background BLE on Android is heavily throttled since Android 8. iOS peripheral mode is locked down. Two strangers' phones reliably forming a GATT connection while the apps aren't actively open is genuinely difficult and a lot of energy. This demo skips that problem entirely by simulating the mesh.
-4. **Privacy / liability.** A stranger carries your encrypted transaction packet on their phone. They can't read it, but its existence is metadata. In a real deployment you'd want to think about regulatory disclosures and what happens if a device is seized.
+- Insufficient funds records `REJECTED` but responds `SETTLED` through ingestion.
+- Failed processing retains its claim, so retries may be dropped without a
+  committed settlement. Cache-cleared replays can return a database constraint
+  error rather than `DUPLICATE_DROPPED`.
+- Equivalent Base64 encodings can bypass text-hash deduplication; nonces are not
+  independently enforced and PIN hashes are not verified.
+- Amount scale is not validated. H2 and PostgreSQL independently round a `0.005` transfer, which
+  can increase combined balances. No new validation rules have been introduced.
+- RSA keys and mesh packets remain process-local while PostgreSQL and configured
+  Redis persistence survive application restarts. Multi-instance decryption also
+  needs shared server keys; this phase does not change key management.
+  External ingestion uses a shared key, but demo controls remain unauthenticated.
+  The H2 console is disabled.
+- Offline instructions do not prove or reserve available funds. Separate payment
+  intents can overspend offline; actual balance checks occur only at settlement.
+- Real BLE discovery, bank integration, rate limiting, durable key management,
+  Redis failover/cluster operation, and comprehensive crash recovery remain
+  outside the current demo. Redis claims are shared, not the entire application state.
 
-For a college / portfolio project: name the concept honestly as **"mesh-routed deferred settlement"** rather than "real-time offline UPI," and you'll have a much stronger pitch. The cryptography and idempotency work here is real engineering and worth showing off.
+See [the Phase 1 review](docs/phase-1-review.md) for detailed characterization.
 
----
+## Next phases
+
+PostgreSQL migration is complete; see the
+[migration review](docs/postgresql-migration-plan.md). Remaining phases:
+
+Bridge authentication and baseline observability are implemented; see the
+[phase review](docs/authentication-observability.md).
+
+1. **Explicitly approved behavior fixes:** the previously flagged outcome, retry,
+   hashing, and monetary-validation changes remain deferred.
+Redis, the last planned infrastructure phase, is implemented; see the
+[Redis review](docs/redis-migration.md). The deferred behavior fixes above and
+remaining production-hardening work require separate approval.
+
+Future changes will update this README alongside their implementation. The
+engineering flow, diagrams, guarantees, and limitations will remain documented.
 
 ## Troubleshooting
 
-**`java: command not found`** — Install JDK 17+. On Windows, `winget install EclipseAdoptium.Temurin.17.JDK` or download from adoptium.net.
-
-**Port 8080 already in use** — Change `server.port` in `application.properties`.
-
-**First `mvnw.cmd` run hangs for a long time** — It's downloading Maven (~10 MB) then dependencies (~80 MB). Give it 2–3 minutes on a normal connection. After that, startup is ~5 seconds.
-
-**`mvnw.cmd : The term 'mvnw.cmd' is not recognized`** — On PowerShell you need to prefix with `.\`: `.\mvnw.cmd spring-boot:run`.
-
-**Tests fail intermittently** — The concurrency test is timing-sensitive. If it ever flakes, run it 3x; if it consistently fails on your hardware, file the actual failure output.
-
----
-
-## License
-
-Demo code, no license. Use it however you want for learning.
+- **PowerShell cannot find `mvnw.cmd`:** use `.\mvnw.cmd` from the repository root.
+- **Java cannot be found:** check `java -version`, `JAVA_HOME`, and `PATH`.
+- **Port conflict:** change `server.port`; update the Vite proxy if the backend
+  moves from port 8080.
+- **Slow first build:** Maven is downloading its toolchain and dependencies.
+- **Frontend dependency conflicts during development:** stop Vite before Maven
+  runs its clean dependency installation.
+- **Expected error logs during tests:** rejection/rollback tests deliberately
+  exercise failures. Check the test summary instead of treating every log as a
+  failed test. Investigate intermittent failures rather than assuming they pass
+  after retries.
+- **Missing DB_PASSWORD or connection failure:** load local settings in the same
+  terminal used to start Java/Maven, verify PostgreSQL is running, and check the
+  database/role. Do not change authentication rules to bypass a failed login.
+- **Flyway checksum or schema validation error:** inspect the migration history
+  and schema. Do not edit an applied migration or enable `create-drop` to hide it;
+  add a new migration for approved schema changes.
+- **Missing BRIDGE_API_KEY:** run `scripts/create-bridge-key.ps1`, then reload
+  local settings in the launch terminal, or set the environment variable yourself.
+- **HTTP 401 on bridge or metrics:** supply exactly one correct key header. A
+  successful key check does not guarantee settlement; inspect the returned outcome
+  and ledger separately.
+- **Redis unavailable:** check `docker exec upimesh-redis redis-cli ping` (or
+  `docker compose exec redis redis-cli ping`). Health reports DOWN. Claims stop
+  ingestion; mesh-state/reset requests can also fail because they access Redis.
+  Restore the connection instead of clearing claims or enabling a local fallback.

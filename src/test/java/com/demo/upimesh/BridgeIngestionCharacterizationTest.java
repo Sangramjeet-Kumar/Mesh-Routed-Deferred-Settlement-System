@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class BridgeIngestionCharacterizationTest {
     private final TestCrypto crypto = new TestCrypto();
     private final TestSettlement settlement = new TestSettlement();
-    private final IdempotencyService idempotency = new IdempotencyService();
+    private final IdempotencyService idempotency = new InMemoryIdempotencyService();
     private final BridgeIngestionService bridge = new BridgeIngestionService();
     private final MeshPacket packet = new MeshPacket();
     private final PaymentInstruction instruction = new PaymentInstruction(

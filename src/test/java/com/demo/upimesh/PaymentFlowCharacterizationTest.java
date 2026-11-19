@@ -5,6 +5,7 @@ import com.demo.upimesh.crypto.ServerKeyHolder;
 import com.demo.upimesh.model.*;
 import com.demo.upimesh.service.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -36,6 +37,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @SpringBootTest(properties = "spring.datasource.url=jdbc:h2:mem:phase1-characterization")
 @AutoConfigureMockMvc
+@org.springframework.context.annotation.Import(MemoryIdempotencyConfig.class)
 class PaymentFlowCharacterizationTest {
     @Autowired private DemoService demo;
     @Autowired private BridgeIngestionService bridge;
@@ -49,6 +51,7 @@ class PaymentFlowCharacterizationTest {
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private MockMvc mvc;
     @Autowired private ObjectMapper json;
+    @Autowired private MeterRegistry meters;
 
     @BeforeEach
     void resetState() {
@@ -62,7 +65,7 @@ class PaymentFlowCharacterizationTest {
     @Test
     void insufficientFundsReturnsSettledButRecordsRejectedWithoutMovingMoney() throws Exception {
         MeshPacket packet = packet(instruction("6000.00"));
-        mvc.perform(post("/api/bridge/ingest").contentType("application/json")
+        mvc.perform(post("/api/bridge/ingest").header("X-Bridge-Api-Key", "characterization-test-key-not-for-deployment").contentType("application/json")
                         .content(json.writeValueAsString(packet)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.outcome").value("SETTLED"))
@@ -165,7 +168,7 @@ class PaymentFlowCharacterizationTest {
         assertBalances("5000.00", "1000.00");
         assertEquals(0, transactions.count());
         idempotency.clear();
-        mvc.perform(post("/api/bridge/ingest").contentType("application/json")
+        mvc.perform(post("/api/bridge/ingest").header("X-Bridge-Api-Key", "characterization-test-key-not-for-deployment").contentType("application/json")
                         .content(json.writeValueAsString(packet)))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.outcome").value("INVALID"));
     }
@@ -290,7 +293,7 @@ class PaymentFlowCharacterizationTest {
         packet.setPacketId(null);
         packet.setCreatedAt(null);
         packet.setTtl(-1);
-        mvc.perform(post("/api/bridge/ingest").contentType("application/json")
+        mvc.perform(post("/api/bridge/ingest").header("X-Bridge-Api-Key", "characterization-test-key-not-for-deployment").contentType("application/json")
                         .content(json.writeValueAsString(packet)))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.outcome").value("SETTLED"));
         Transaction tx = transactions.findAll().get(0);
@@ -304,6 +307,69 @@ class PaymentFlowCharacterizationTest {
         mesh.gossipOnce();
         mvc.perform(post("/api/mesh/flush")).andExpect(status().isOk());
         assertEquals(-2, transactions.findAll().get(0).getHopCount());
+    }
+
+    @Test
+    void unauthorizedUploadIsRejectedBeforeParsingOrClaiming() throws Exception {
+        mvc.perform(post("/api/bridge/ingest").contentType("application/json").content("not-json"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.reason").value("invalid_or_missing_api_key"))
+                .andExpect(header().exists("X-Request-Id"));
+        assertEquals(0, idempotency.size());
+        assertEquals(0, transactions.count());
+        assertBalances("5000.00", "1000.00");
+    }
+
+    @Test
+    void invalidOrRepeatedKeysAreRejected() throws Exception {
+        for (String key : new String[]{"wrong", "", "characterization-test-key-not-for-deployment "}) {
+            mvc.perform(post("/api/bridge/ingest").header("X-Bridge-Api-Key", key))
+                    .andExpect(status().isUnauthorized());
+        }
+        mvc.perform(post("/api/bridge/ingest").header("X-Bridge-Api-Key",
+                        "characterization-test-key-not-for-deployment", "wrong"))
+                .andExpect(status().isUnauthorized());
+        assertEquals(0, idempotency.size());
+    }
+
+    @Test
+    void healthIsMinimalAndMetricsRequireKey() throws Exception {
+        mvc.perform(get("/actuator/health")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"))
+                .andExpect(jsonPath("$.components").doesNotExist());
+        mvc.perform(get("/actuator/metrics")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/actuator/metrics/jvm.memory.used")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/actuator/metrics").header("X-Bridge-Api-Key", "characterization-test-key-not-for-deployment"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.names").isArray());
+        mvc.perform(get("/actuator/env")).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void ingestionMetricsCountLegacyResponsesAndDuplicatesWithoutChangingResults() throws Exception {
+        long settledBefore = ingestionCount("SETTLED");
+        long duplicatesBefore = ingestionCount("DUPLICATE_DROPPED");
+        MeshPacket packet = packet(instruction("6000.00"));
+        assertEquals("SETTLED", bridge.ingest(packet, "bridge", 0).outcome());
+        assertEquals("DUPLICATE_DROPPED", bridge.ingest(packet, "bridge", 0).outcome());
+        assertEquals(Transaction.Status.REJECTED, transactions.findAll().get(0).getStatus());
+        assertEquals(settledBefore + 1, ingestionCount("SETTLED"));
+        assertEquals(duplicatesBefore + 1, ingestionCount("DUPLICATE_DROPPED"));
+    }
+
+    @Test
+    void responseCorrelationIdsAreFreshAndMdcIsRestored() throws Exception {
+        String first = mvc.perform(get("/api/accounts").header("X-Request-Id", "untrusted-client-value"))
+                .andExpect(status().isOk()).andReturn().getResponse().getHeader("X-Request-Id");
+        String second = mvc.perform(get("/api/accounts")).andReturn().getResponse().getHeader("X-Request-Id");
+        assertNotNull(first);
+        assertNotEquals("untrusted-client-value", first);
+        assertNotEquals(first, second);
+        assertNull(org.slf4j.MDC.get("requestId"));
+    }
+
+    private long ingestionCount(String outcome) {
+        var timer = meters.find("mesh.ingestion").tag("outcome", outcome).timer();
+        return timer == null ? 0 : timer.count();
     }
 
     private PaymentInstruction instruction(String amount) {
